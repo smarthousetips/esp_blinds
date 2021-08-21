@@ -1,0 +1,233 @@
+esphome:
+  name: newblinds
+  platform: ESP32
+  board: esp32dev
+
+  on_boot:
+    then:
+      - script.execute: consider_deep_sleep
+    # - priority: -200.0
+    #   then:
+    #   - stepper.report_position: # Set stepper to global variable
+    #       id: stepper_motor
+    #       position: !lambda return id(stepper_motor_global);
+    #   - stepper.set_target: # Set stepper to global variable
+    #       id: stepper_motor
+    #       target: !lambda return id(stepper_motor_global);
+    #   - if: # If blind is Closed
+    #       condition:
+    #         - lambda: 'return id(stepper_motor_global) == 0;'
+    #       then: # Publish state etc.
+    #         - cover.template.publish:
+    #             id: office_tilt
+    #             state: CLOSED
+    #             current_operation: IDLE
+    #   - if: # If blind is Open
+    #       condition:
+    #         - lambda: 'return id(stepper_motor_global) == id(endstop);'
+    #       then: # Publish state etc.
+    #         - cover.template.publish:
+    #             id: office_tilt
+    #             state: OPEN
+    #             current_operation: IDLE
+    #   - if: # If blind is Neither
+    #       condition:
+    #         - lambda: 'return (id(stepper_motor_global) != 0) && (id(stepper_motor_global) != id(endstop));'
+    #       then: #  # Publish state etc.
+    #         - cover.template.publish:
+    #             id: office_tilt
+    #             position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+    #             current_operation: IDLE
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  password: !secret password
+ota:
+  password: !secret ota
+
+wifi:
+  ssid: !secret ssid
+  password: !secret password
+  fast_connect: true
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Office-Room-Blinds"
+    password: !secret password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+globals:
+  - id: stepper_motor_global # Integer for storing the stepper position in case of reboot
+    type: int
+    restore_value: True
+    initial_value: '0'
+
+  - id: openclosed # Boolean to store OPEN/CLOSED state
+    type: bool
+    restore_value: True
+    initial_value: '0'
+
+  - id: endstop # Variable for storing ENDSTOP (how far to move stepper)
+    type: int
+    restore_value: True
+    initial_value: '1800'   # this is the max value
+
+binary_sensor:
+  - platform: homeassistant
+    id: prevent_deep_sleep
+    entity_id: input_boolean.prevent_deep_sleep
+    on_state:
+      then:
+        if:
+          condition:
+            binary_sensor.is_off: prevent_deep_sleep
+          then: 
+            deep_sleep.enter: deep_sleep_control
+switch:
+  - platform: restart
+    name: "Kids Blinds Restart"
+  - platform: gpio
+    name: "blind relay"
+    id: relay
+    restore_mode: ALWAYS_OFF
+    pin:
+      number: 5
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: 10min
+
+script:
+  - id: consider_deep_sleep
+    mode: queued
+    then:
+      - delay: 15s
+      - if:
+          condition:
+            binary_sensor.is_on: prevent_deep_sleep
+          then:
+            - deep_sleep.prevent: deep_sleep_control
+            - logger.log: 'Skipping sleep, per prevent_deep_sleep'
+            - delay: 1440min
+          else:
+            - deep_sleep.enter: deep_sleep_control
+      - script.execute: consider_deep_sleep
+      
+stepper:
+  - platform: a4988
+    id: stepper_motor
+    step_pin: 16
+    dir_pin: 
+      number: 17
+      inverted: true   
+    sleep_pin: 
+      number: 19
+    max_speed: 700 steps/s
+    acceleration: inf
+    deceleration: inf
+    
+cover:
+  - platform: template
+    name: Office Room Blinds
+    id: office_tilt
+
+    open_action:
+      then:
+        - switch.turn_on: relay
+        - logger.log: "Opening"
+        - stepper.set_target: 
+            id: stepper_motor
+            target: 800
+        - while:
+            condition:
+              lambda: 'return id(stepper_motor).current_position > 800;'
+            then:
+              - cover.template.publish:
+                  id: office_tilt
+                  position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+                  current_operation: OPENING
+              - delay: 1500 ms
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position; 
+        - globals.set: # Set toggle to OPEN (No need for 'optimistic mode')
+            id: openclosed
+            value: '1'
+        - cover.template.publish:
+            id: office_tilt
+            state: OPEN 
+            current_operation: IDLE
+        - switch.turn_off: relay
+
+    close_action:
+      then:
+        - switch.turn_on: relay
+        - logger.log: "Closing"
+        - stepper.set_target: # Send stepper to 0
+            id: stepper_motor
+            target: '1800'
+        - while:
+            condition:
+              lambda: 'return id(stepper_motor).current_position < 1800;'
+            then:
+              - cover.template.publish:
+                  id: office_tilt
+                  position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+                  current_operation: CLOSING
+              - delay: 1500 ms
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position; 
+        - globals.set: # Set toggle to CLOSED (No need for 'optimistic mode')
+            id: openclosed
+            value: '0'
+        - cover.template.publish:
+            id: office_tilt
+            state: CLOSED
+            current_operation: IDLE
+        - switch.turn_off: relay
+
+    position_action:
+      then:
+        - switch.turn_on: relay
+        - stepper.set_target:
+            id: stepper_motor
+            target: !lambda return int(id(endstop) * pos);
+        - while:
+            condition:
+              lambda: 'return id(stepper_motor).current_position != int(id(endstop) * pos);'
+            then:
+              - cover.template.publish:
+                  id: office_tilt
+                  position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+              - delay: 1500 ms
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position; 
+        - cover.template.publish:
+            id: office_tilt
+            position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+            current_operation: IDLE
+        - switch.turn_off: relay
+
+    stop_action:
+      then:
+        - switch.turn_off: relay
+        - stepper.set_target:
+            id: stepper_motor
+            target: !lambda return id(stepper_motor).current_position;
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position;
+        - cover.template.publish:
+            id: office_tilt
+            position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+            current_operation: IDLE
+    has_position: true
+    device_class: blind
